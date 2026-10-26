@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 from datetime import datetime
 
 import requests
@@ -18,6 +19,18 @@ netbox.headers.update({
 })
 
 
+def message_erreur(service, url, erreur):
+    if isinstance(erreur, requests.exceptions.Timeout):
+        return f"Erreur : {service} ({url}) ne répond pas, délai de {TIMEOUT} s dépassé."
+    if isinstance(erreur, requests.exceptions.ConnectionError):
+        return (f"Erreur : {service} injoignable à {url}. "
+                f"Vérifiez qu'elle est démarrée (docker compose ps).")
+    if isinstance(erreur, requests.exceptions.HTTPError):
+        return (f"Erreur : {service} a répondu {erreur.response.status_code} "
+                f"sur {erreur.request.url}.")
+    return f"Erreur : {service} : {erreur}"
+
+
 def lire_stats(id_conteneur):
     reponse = session.get(f"{DOCKER}/containers/{id_conteneur}/stats",
                           params={"stream": "false"}, timeout=TIMEOUT)
@@ -31,6 +44,27 @@ def lire_stats(id_conteneur):
 
     memoire_mo = stats["memory_stats"]["usage"] / 1024 / 1024
     return pourcent, memoire_mo
+
+
+def inventaire_docker():
+    reponse = session.get(f"{DOCKER}/containers/json", params={"all": "true"}, timeout=TIMEOUT)
+    reponse.raise_for_status()
+
+    conteneurs = []
+    for c in reponse.json():
+        conteneur = {
+            "nom": c["Names"][0].lstrip("/"),
+            "image": c["Image"],
+            "etat": c["State"],
+            "cpu_pourcent": None,
+            "memoire_mo": None,
+        }
+        if c["State"] == "running":
+            pourcent, memoire_mo = lire_stats(c["Id"])
+            conteneur["cpu_pourcent"] = round(pourcent, 2)
+            conteneur["memoire_mo"] = round(memoire_mo, 1)
+        conteneurs.append(conteneur)
+    return conteneurs
 
 
 def tout_lire(session, url):
@@ -62,43 +96,40 @@ def releve_netbox():
     }
 
 
-reponse = session.get(f"{DOCKER}/containers/json", params={"all": "true"}, timeout=TIMEOUT)
-reponse.raise_for_status()
+def main():
+    try:
+        conteneurs = inventaire_docker()
+    except requests.exceptions.RequestException as e:
+        sys.exit(message_erreur("l'API Docker", DOCKER, e))
 
-conteneurs = []
-for c in reponse.json():
-    conteneur = {
-        "nom": c["Names"][0].lstrip("/"),
-        "image": c["Image"],
-        "etat": c["State"],
-        "cpu_pourcent": None,
-        "memoire_mo": None,
+    try:
+        releve_nb = releve_netbox()
+    except requests.exceptions.RequestException as e:
+        sys.exit(message_erreur("l'API NetBox", NETBOX, e))
+
+    inventaire = {
+        "date_releve": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "conteneurs": conteneurs,
+        "netbox": releve_nb,
     }
-    if c["State"] == "running":
-        pourcent, memoire_mo = lire_stats(c["Id"])
-        conteneur["cpu_pourcent"] = round(pourcent, 2)
-        conteneur["memoire_mo"] = round(memoire_mo, 1)
-    conteneurs.append(conteneur)
 
-inventaire = {
-    "date_releve": datetime.now().astimezone().isoformat(timespec="seconds"),
-    "conteneurs": conteneurs,
-    "netbox": releve_netbox(),
-}
+    with open("inventaire.json", "w", encoding="utf-8") as f:
+        json.dump(inventaire, f, indent=2, ensure_ascii=False)
 
-with open("inventaire.json", "w", encoding="utf-8") as f:
-    json.dump(inventaire, f, indent=2, ensure_ascii=False)
+    demarres = [c for c in conteneurs if c["etat"] == "running"]
+    print(f"Relevé du {inventaire['date_releve']}")
+    print(f"{len(conteneurs)} conteneurs, dont {len(demarres)} démarrés\n")
+    print(f"{'NOM':<20} {'IMAGE':<25} {'ÉTAT':<10} {'CPU %':>6} {'RAM Mo':>8}")
+    for c in conteneurs:
+        cpu = f"{c['cpu_pourcent']:.1f}" if c["cpu_pourcent"] is not None else "-"
+        ram = f"{c['memoire_mo']:.1f}" if c["memoire_mo"] is not None else "-"
+        print(f"{c['nom']:<20} {c['image']:<25} {c['etat']:<10} {cpu:>6} {ram:>8}")
+    print(f"\nMémoire totale des conteneurs démarrés : {sum(c['memoire_mo'] for c in demarres):.1f} Mo")
 
-demarres = [c for c in conteneurs if c["etat"] == "running"]
-print(f"Relevé du {inventaire['date_releve']}")
-print(f"{len(conteneurs)} conteneurs, dont {len(demarres)} démarrés\n")
-print(f"{'NOM':<20} {'IMAGE':<25} {'ÉTAT':<10} {'CPU %':>6} {'RAM Mo':>8}")
-for c in conteneurs:
-    cpu = f"{c['cpu_pourcent']:.1f}" if c["cpu_pourcent"] is not None else "-"
-    ram = f"{c['memoire_mo']:.1f}" if c["memoire_mo"] is not None else "-"
-    print(f"{c['nom']:<20} {c['image']:<25} {c['etat']:<10} {cpu:>6} {ram:>8}")
-print(f"\nMémoire totale des conteneurs démarrés : {sum(c['memoire_mo'] for c in demarres):.1f} Mo")
+    nb = inventaire["netbox"]
+    print(f"\nNetBox {nb['version']} : {nb['types_objets']} types d'objets lus "
+          f"(NetBox en annonce {nb['types_objets_annonces']})")
 
-nb = inventaire["netbox"]
-print(f"\nNetBox {nb['version']} : {nb['types_objets']} types d'objets lus "
-      f"(NetBox en annonce {nb['types_objets_annonces']})")
+
+if __name__ == "__main__":
+    main()
